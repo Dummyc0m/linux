@@ -43,6 +43,7 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/list.h>
+#include <linux/workingset_report.h>
 
 /*
  * Balloon device information descriptor.

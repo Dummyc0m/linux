@@ -65,6 +65,16 @@ void wsr_remove_sysfs(struct node *node);
 bool wsr_refresh_report(struct wsr_state *wsr, struct mem_cgroup *root,
 			struct pglist_data *pgdat, unsigned long *refresh_time);
 
+int register_working_set_receiver(
+	void *receiver,
+	void (*wss_receiver_notify)(void *wss_receiver,
+				    struct wsr_report_bin *bins, int node_id),
+	struct pglist_data *pgdat, unsigned long *intervals,
+	unsigned long nr_bins, unsigned long refresh_threshold,
+	unsigned long report_threshold);
+void unregister_working_set_receiver(void *receiver);
+bool working_set_request(struct pglist_data *pgdat);
+
 #ifdef CONFIG_WORKINGSET_REPORT_AGING
 void wsr_wakeup_aging_thread(void);
 #else /* CONFIG_WORKINGSET_REPORT_AGING */
@@ -90,6 +100,19 @@ static inline void wsr_init_sysfs(struct node *node)
 {
 }
 static inline void wsr_remove_sysfs(struct node *node)
+{
+}
+static inline int register_working_set_receiver(
+	void *receiver,
+	void (*wss_receiver_notify)(void *wss_receiver,
+				    struct wsr_report_bin *bins, int node_id),
+	struct pglist_data *pgdat, unsigned long *intervals,
+	unsigned long nr_bins, unsigned long refresh_threshold,
+	unsigned long report_threshold)
+{
+	return 0;
+}
+static inline void unregister_working_set_receiver(void *receiver)
 {
 }
 #endif /* CONFIG_WORKINGSET_REPORT */

@@ -550,6 +550,47 @@ void wsr_remove_sysfs(struct node *node)
 }
 EXPORT_SYMBOL_GPL(wsr_remove_sysfs);
 
+/* protects wsr_receiver_list */
+static spinlock_t wsr_receiver_lock;
+static struct list_head wsr_receiver_list;
+
+struct wsr_receiver {
+	void (*wss_receiver_notify)(struct wsr_receiver *,
+				      struct wsr_report_bin *bins, int node_id);
+	struct list_head list;
+};
+
+TODO
+
+static void (*wss_receiver_notify)(void *wss_receiver,
+				      struct wsr_report_bin *bins, int node_id);
+
+static void notify_receiver(struct wsr_state *wsr, struct mem_cgroup *memcg, struct pglist_data *pgdat)
+{
+	if (wss_receiver) {
+		struct wsr_page_age_histo *page_age = NULL;
+
+		wsr_refresh_report(wsr, memcg, pgdat, NULL);
+		mutex_lock(&wsr->page_age_lock);
+		page_age = READ_ONCE(wsr->page_age);
+		if (!page_age)
+			goto unlock;
+		wss_receiver_notify(wss_receiver, page_age->bins.bins,
+				    pgdat->node_id);
+unlock:
+		mutex_unlock(&wsr->page_age_lock);
+	}
+}
+
+bool working_set_request(struct pglist_data *pgdat)
+{
+	struct wsr_state *wsr = &mem_cgroup_lruvec(NULL, pgdat)->wsr;
+
+	notify_receiver(wsr, NULL, pgdat);
+	return true;
+}
+EXPORT_SYMBOL_GPL(working_set_request);
+
 void notify_workingset(struct mem_cgroup *memcg, struct pglist_data *pgdat)
 {
 	struct wsr_state *wsr = &mem_cgroup_lruvec(memcg, pgdat)->wsr;
@@ -558,4 +599,70 @@ void notify_workingset(struct mem_cgroup *memcg, struct pglist_data *pgdat)
 		kernfs_notify(wsr->page_age_sys_file);
 	else
 		cgroup_file_notify(wsr->page_age_cgroup_file);
+
+	notify_receiver(wsr, memcg, pgdat);
 }
+
+/*
+ * Register/unregister a receiver of working set notifications
+ * TODO: Replace with a proper registration interface, similar to shrinkers.
+ */
+int register_working_set_receiver(
+	void *receiver,
+	void (*receiver_notify)(void *wss_receiver,
+				    struct wsr_report_bin *bins, int node_id),
+	struct pglist_data *pgdat, unsigned long *intervals,
+	unsigned long nr_bins, unsigned long refresh_threshold,
+	unsigned long report_threshold)
+{
+	struct wsr_state *wsr;
+	struct wsr_page_age_histo *page_age = NULL, *old;
+	int i;
+
+	wss_receiver = receiver;
+	wss_receiver_notify = receiver_notify;
+	wsr = &mem_cgroup_lruvec(NULL, pgdat)->wsr;
+
+	if (!pgdat)
+		return 0;
+
+	if (!intervals || !nr_bins)
+		return 0;
+
+	/* BUG this is a hack with unsound logic for edge case nr_bins */
+	if (nr_bins) {
+		page_age = kzalloc(sizeof(struct wsr_page_age_histo),
+				   GFP_KERNEL_ACCOUNT);
+
+		if (!page_age)
+			return -ENOMEM;
+
+		for (i = 0; i < nr_bins - 1; i++) {
+			page_age->bins.bins[i].idle_age =
+				msecs_to_jiffies(*intervals);
+			intervals++;
+		}
+		page_age->bins.nr_bins = i;
+		page_age->bins.bins[i].idle_age = WORKINGSET_INTERVAL_MAX;
+	}
+
+	/* This is a hack that takes over the system-wide receiver */
+	mutex_lock(&wsr->page_age_lock);
+	old = xchg(&wsr->page_age, page_age);
+	mutex_unlock(&wsr->page_age_lock);
+	kfree(old);
+	WRITE_ONCE(wsr->refresh_interval, msecs_to_jiffies(refresh_threshold));
+	WRITE_ONCE(wsr->report_threshold, msecs_to_jiffies(report_threshold));
+	if (nr_bins && READ_ONCE(wsr->refresh_interval))
+		wsr_wakeup_aging_thread();
+	return 0;
+}
+EXPORT_SYMBOL(register_working_set_receiver);
+
+void unregister_working_set_receiver(void *receiver)
+{
+	/* This is a hack */
+	wss_receiver = NULL;
+	wss_receiver_notify = NULL;
+}
+EXPORT_SYMBOL(unregister_working_set_receiver);

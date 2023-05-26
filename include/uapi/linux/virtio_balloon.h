@@ -37,6 +37,7 @@
 #define VIRTIO_BALLOON_F_FREE_PAGE_HINT	3 /* VQ to report free pages */
 #define VIRTIO_BALLOON_F_PAGE_POISON	4 /* Guest is using page poisoning */
 #define VIRTIO_BALLOON_F_REPORTING	5 /* Page reporting virtqueue */
+#define VIRTIO_BALLOON_F_WS_REPORTING 6 /* Working Set Size reporting */
 
 /* Size of a PFN in the balloon interface. */
 #define VIRTIO_BALLOON_PFN_SHIFT 12
@@ -59,6 +60,9 @@ struct virtio_balloon_config {
 	};
 	/* Stores PAGE_POISON if page poisoning is in use */
 	__le32 poison_val;
+	/* Number of bins for Working Set report if in use. */
+	__u8 working_set_num_bins;
+	__u8 padding[3];
 };
 
 #define VIRTIO_BALLOON_S_SWAP_IN  0   /* Amount of memory swapped in */
@@ -127,5 +131,34 @@ struct virtio_balloon_stat {
 	__virtio16 tag;
 	__virtio64 val;
 } __attribute__((packed));
+
+/* Enumerate all possible message types from the device. */
+enum virtio_balloon_working_set_op {
+	VIRTIO_BALLOON_WS_REQUEST = 1,
+	VIRTIO_BALLOON_WS_CONFIG = 2,
+};
+
+/* The metadata values for Working Set Reports. */
+enum virtio_balloon_working_set_tags {
+	/* Memory is reclaimable by guest */
+	VIRTIO_BALLOON_WS_RECLAIMABLE = 0,
+	/* Memory can only be discarded by guest */
+	VIRTIO_BALLOON_WS_DISCARDABLE = 1,
+};
+
+/*
+ * Working Set Report structure.
+ */
+struct virtio_balloon_working_set {
+	/* A tag for additional metadata. */
+	__le16 tag;
+	/* the NUMA node for this report. */
+	__le16 node_id;
+	uint8_t reserved[4];
+	/* The idle age (in ms) of this bin of memory */
+	__virtio64 idle_age_ms;
+	/* A bin each for anonymous and file-backed memory. */
+	__le64 memory_size_bytes[2];
+};
 
 #endif /* _LINUX_VIRTIO_BALLOON_H */

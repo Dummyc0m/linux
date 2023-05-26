@@ -6,11 +6,13 @@
  *  Copyright 2008 Rusty Russell IBM Corporation
  */
 
+#include <linux/printk.h>
 #include <linux/virtio.h>
 #include <linux/virtio_balloon.h>
 #include <linux/swap.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
+#include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/balloon_compaction.h>
@@ -18,6 +20,7 @@
 #include <linux/wait.h>
 #include <linux/mm.h>
 #include <linux/page_reporting.h>
+#include <linux/workingset_report.h>
 
 /*
  * Balloon device works in 4K page units.  So each page is pointed to by
@@ -45,6 +48,8 @@ enum virtio_balloon_vq {
 	VIRTIO_BALLOON_VQ_STATS,
 	VIRTIO_BALLOON_VQ_FREE_PAGE,
 	VIRTIO_BALLOON_VQ_REPORTING,
+	VIRTIO_BALLOON_VQ_WORKING_SET,
+	VIRTIO_BALLOON_VQ_NOTIFY,
 	VIRTIO_BALLOON_VQ_MAX
 };
 
@@ -54,7 +59,8 @@ enum virtio_balloon_config_read {
 
 struct virtio_balloon {
 	struct virtio_device *vdev;
-	struct virtqueue *inflate_vq, *deflate_vq, *stats_vq, *free_page_vq;
+	struct virtqueue *inflate_vq, *deflate_vq, *stats_vq, *free_page_vq,
+		*working_set_vq, *notification_vq;
 
 	/* Balloon's own wq for cpu-intensive work items */
 	struct workqueue_struct *balloon_wq;
@@ -64,6 +70,8 @@ struct virtio_balloon {
 	/* The balloon servicing is delegated to a freezable workqueue. */
 	struct work_struct update_balloon_stats_work;
 	struct work_struct update_balloon_size_work;
+	struct work_struct update_balloon_working_set_work;
+	struct work_struct update_balloon_notification_work;
 
 	/* Prevent updating balloon when it is being canceled. */
 	spinlock_t stop_update_lock;
@@ -103,12 +111,19 @@ struct virtio_balloon {
 	/* Synchronize access/update to this struct virtio_balloon elements */
 	struct mutex balloon_lock;
 
+	/* Synchronize access/update to working set info. */
+	struct mutex balloon_ws_lock;
+
 	/* The array of pfns we tell the Host about. */
 	unsigned int num_pfns;
 	__virtio32 pfns[VIRTIO_BALLOON_ARRAY_PFNS_MAX];
 
 	/* Memory statistics */
 	struct virtio_balloon_stat stats[VIRTIO_BALLOON_S_NR];
+
+	/* A buffer to hold incoming notification from the host. */
+	unsigned int notification_size;
+	void *notification_buf;
 
 	/* Shrinker to return free pages - VIRTIO_BALLOON_F_FREE_PAGE_HINT */
 	struct shrinker *shrinker;
@@ -124,6 +139,10 @@ struct virtio_balloon {
 	spinlock_t wakeup_lock;
 	bool processing_wakeup_event;
 	u32 wakeup_signal_mask;
+
+	/* Working Set reporting */
+	u8 working_set_num_bins;
+	struct virtio_balloon_working_set *working_set;
 };
 
 #define VIRTIO_BALLOON_WAKEUP_SIGNAL_ADJUST (1 << 0)
@@ -339,6 +358,41 @@ static unsigned int leak_balloon(struct virtio_balloon *vb, size_t num)
 	return num_freed_pages;
 }
 
+/* Must hold the balloon_ws_lock while calling this function. */
+static inline void reset_working_set(struct virtio_balloon *vb)
+{
+	int i;
+
+	for (i = 0; i < vb->working_set_num_bins; ++i) {
+		vb->working_set[i].tag = cpu_to_virtio16(vb->vdev, -1);
+		vb->working_set[i].node_id = cpu_to_virtio16(vb->vdev, -1);
+		vb->working_set[i].idle_age_ms = cpu_to_virtio64(vb->vdev, 0);
+		vb->working_set[i].memory_size_bytes[0] = cpu_to_virtio64(vb->vdev, -1);
+		vb->working_set[i].memory_size_bytes[1] = cpu_to_virtio64(vb->vdev, -1);
+	}
+}
+
+/* Must hold the balloon_ws_lock while calling this function. */
+static inline void update_working_set(struct virtio_balloon *vb, int idx,
+			       u64 idle_age, u64 bytes_anon,
+			       u64 bytes_file, int node_id)
+{
+	vb->working_set[idx].tag = cpu_to_virtio16(vb->vdev, VIRTIO_BALLOON_WS_RECLAIMABLE);
+	vb->working_set[idx].node_id = cpu_to_virtio16(vb->vdev, node_id);
+	vb->working_set[idx].idle_age_ms = cpu_to_virtio64(vb->vdev, idle_age);
+	vb->working_set[idx].memory_size_bytes[0] = cpu_to_virtio64(vb->vdev,
+	     bytes_anon);
+	vb->working_set[idx].memory_size_bytes[1] = cpu_to_virtio64(vb->vdev,
+	     bytes_file);
+}
+
+static bool working_set_is_init(struct virtio_balloon *vb)
+{
+	if (vb->working_set[0].idle_age_ms > 0)
+		return true;
+	return false;
+}
+
 static inline void update_stat(struct virtio_balloon *vb, int idx,
 			       u16 tag, u64 val)
 {
@@ -459,6 +513,36 @@ static void stats_handle_request(struct virtio_balloon *vb)
 	virtqueue_kick(vq);
 }
 
+static bool virtio_balloon_working_set_request(void)
+{
+	struct pglist_data *pgdat;
+	int nid = NUMA_NO_NODE;
+	if (IS_ENABLED(CONFIG_NUMA)) {
+		for_each_online_node(nid) {
+			if (node_possible(nid)) {
+				pgdat = NODE_DATA(nid);
+				if (!working_set_request(pgdat)) {
+					return false;
+				}
+			}
+		}
+	} else {
+		pgdat = NODE_DATA(nid);
+		return working_set_request(pgdat);
+	}
+	return true;
+}
+
+static void notification_receive(struct virtqueue *vq)
+{
+	struct virtio_balloon *vb = vq->vdev->priv;
+
+	spin_lock(&vb->stop_update_lock);
+	if (!vb->stop_update)
+		queue_work(system_freezable_wq, &vb->update_balloon_notification_work);
+	spin_unlock(&vb->stop_update_lock);
+}
+
 static inline s64 towards_target(struct virtio_balloon *vb)
 {
 	s64 target;
@@ -550,6 +634,168 @@ static void update_balloon_stats_func(struct work_struct *work)
 	finish_wakeup_event(vb);
 }
 
+/*
+ * Function to send the working set to a receiver (e.g. the balloon driver)
+ * TODO: Replace with a proper registration interface, similar to shrinkers.
+ */
+static void working_set_notify(void *wss_receiver, struct wsr_report_bin *bins,
+			       int node_id)
+{
+	u64 bytes_nr_file, bytes_nr_anon;
+	struct virtio_balloon *vb = wss_receiver;
+	int idx = 0;
+
+	if (!mutex_trylock(&vb->balloon_ws_lock)) {
+		printk(KERN_ERR "WORKING SET notify trylock failed. Send stale data.\n");
+		goto out;
+	}
+	for (; idx < vb->working_set_num_bins; idx++) {
+		bytes_nr_anon = (u64)(bins[idx].nr_pages[0]) * PAGE_SIZE;
+		bytes_nr_file = (u64)(bins[idx].nr_pages[1]) * PAGE_SIZE;
+		update_working_set(vb, idx, jiffies_to_msecs(bins[idx].idle_age),
+			bytes_nr_anon, bytes_nr_file, node_id);
+	}
+	// Last bin has age U64_MAX by convention.
+	vb->working_set[vb->working_set_num_bins - 1].idle_age_ms = U64_MAX;
+	mutex_unlock(&vb->balloon_ws_lock);
+out:
+	/* Send the working set report to the device. */
+	spin_lock(&vb->stop_update_lock);
+	if (!vb->stop_update)
+		queue_work(system_freezable_wq, &vb->update_balloon_working_set_work);
+	spin_unlock(&vb->stop_update_lock);
+}
+
+static int virtio_balloon_register_working_set_receiver(struct virtio_balloon *vb,
+	__virtio32 *intervals, unsigned long nr_bins, __virtio32 refresh_ms,
+	__virtio32 report_ms)
+{
+	struct pglist_data *pgdat;
+	unsigned long *bin_intervals = NULL;
+	int i, err;
+	int nid = NUMA_NO_NODE;
+
+	if (intervals && nr_bins) {
+		/* TODO: keep values as 32-bits throughout. */
+		bin_intervals = kzalloc(sizeof(unsigned long) * (nr_bins-1),
+			GFP_KERNEL);
+
+		if (!bin_intervals)
+			return -ENOMEM;
+		for (i = 0; i < nr_bins - 1; i++)
+			bin_intervals[i] = (unsigned long)intervals[i];
+
+		if (IS_ENABLED(CONFIG_NUMA)) {
+			for_each_online_node(nid) {
+				pgdat = NODE_DATA(nid);
+				err = register_working_set_receiver(
+					vb, working_set_notify, pgdat,
+					&(bin_intervals[0]), nr_bins,
+					(unsigned long)refresh_ms,
+					(unsigned long)report_ms);
+				if (err) {
+					kfree(bin_intervals);
+					return err;
+				}
+			}
+		} else {
+			pgdat = NODE_DATA(nid);
+			err = register_working_set_receiver(
+				vb, working_set_notify, pgdat,
+				&(bin_intervals[0]), nr_bins,
+				(unsigned long)refresh_ms,
+				(unsigned long)report_ms);
+		}
+		kfree(bin_intervals);
+		return err;
+	}
+	pr_warn("registering in balloon error\n");
+	return -EINVAL;
+}
+
+static void update_balloon_notification_func(struct work_struct *work)
+{
+	struct virtio_balloon *vb;
+	struct scatterlist sg_in;
+	__virtio32 *bin_intervals;
+	__virtio32 refresh_ms, report_ms;
+	int16_t tag;
+	char *buf;
+	int len;
+
+	vb = container_of(work, struct virtio_balloon,
+			  update_balloon_notification_work);
+
+	/* Read a Working Set notification from the device. */
+	buf = (char *)vb->notification_buf;
+	tag = *((int16_t *)buf);
+	buf += sizeof(int16_t);
+	if (tag == VIRTIO_BALLOON_WS_REQUEST) {
+		if (!virtio_balloon_working_set_request()) {
+			dev_err(&vb->vdev->dev, "in notify func, couldn't update WS.");
+			// We couldn't update the working set. Notify with stale data.
+			spin_lock(&vb->stop_update_lock);
+			if (!vb->stop_update)
+				queue_work(system_freezable_wq, &vb->update_balloon_working_set_work);
+			spin_unlock(&vb->stop_update_lock);
+		}
+	} else if (tag == VIRTIO_BALLOON_WS_CONFIG) {
+		mutex_lock(&vb->balloon_ws_lock);
+		reset_working_set(vb);
+		mutex_unlock(&vb->balloon_ws_lock);
+		bin_intervals = (__virtio32 *) buf;
+		buf += sizeof(__virtio32) * (vb->working_set_num_bins - 1);
+		refresh_ms = *((__virtio32 *) buf);
+		buf += sizeof(__virtio32);
+		report_ms = *((__virtio32 *) buf);
+		virtio_balloon_register_working_set_receiver(vb, bin_intervals,
+			vb->working_set_num_bins, refresh_ms, report_ms);
+	} else {
+		dev_warn(&vb->vdev->dev, "Received invalid notification, %u\n", tag);
+		return;
+	}
+
+	/* Detach all the used buffers from the vq */
+	while (virtqueue_get_buf(vb->notification_vq, &len))
+		;
+	/* Add a new notification buffer for device to fill. */
+	sg_init_one(&sg_in, vb->notification_buf, vb->notification_size);
+	virtqueue_add_inbuf(vb->notification_vq, &sg_in, 1, vb, GFP_KERNEL);
+	virtqueue_kick(vb->notification_vq);
+}
+
+static void update_balloon_ws_func(struct work_struct *work)
+{
+	struct virtio_balloon *vb;
+	struct scatterlist sg_out;
+	int err = 0;
+	int unused;
+
+	vb = container_of(work, struct virtio_balloon,
+			  update_balloon_working_set_work);
+
+	mutex_lock(&vb->balloon_ws_lock);
+	if (working_set_is_init(vb)) {
+		/* Detach all the used buffers from the vq */
+		while (virtqueue_get_buf(vb->working_set_vq, &unused))
+			;
+		sg_init_one(&sg_out, vb->working_set,
+			(sizeof(struct virtio_balloon_working_set) *
+			vb->working_set_num_bins));
+		err = virtqueue_add_outbuf(vb->working_set_vq, &sg_out, 1, vb, GFP_KERNEL);
+	} else {
+		dev_warn(&vb->vdev->dev, "Working Set not initialized.");
+		err = -EINVAL;
+	}
+	mutex_unlock(&vb->balloon_ws_lock);
+	if (unlikely(err)) {
+		dev_err(&vb->vdev->dev,
+			"Failed to send working set report err = %d\n", err);
+	} else {
+		virtqueue_kick(vb->working_set_vq);
+	}
+}
+
 static void update_balloon_size_func(struct work_struct *work)
 {
 	struct virtio_balloon *vb;
@@ -605,6 +851,13 @@ static int init_vqs(struct virtio_balloon *vb)
 		vqs_info[VIRTIO_BALLOON_VQ_REPORTING].callback = balloon_ack;
 	}
 
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_WS_REPORTING)) {
+		vqs_info[VIRTIO_BALLOON_VQ_WORKING_SET].name = "ws";
+		vqs_info[VIRTIO_BALLOON_VQ_WORKING_SET].callback = NULL;
+		vqs_info[VIRTIO_BALLOON_VQ_NOTIFY].name = "notify";
+		vqs_info[VIRTIO_BALLOON_VQ_NOTIFY].callback = notification_receive;
+	}
+
 	err = virtio_find_vqs(vb->vdev, VIRTIO_BALLOON_VQ_MAX, vqs,
 			      vqs_info, NULL);
 	if (err)
@@ -615,6 +868,7 @@ static int init_vqs(struct virtio_balloon *vb)
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_STATS_VQ)) {
 		struct scatterlist sg;
 		unsigned int num_stats;
+
 		vb->stats_vq = vqs[VIRTIO_BALLOON_VQ_STATS];
 
 		/*
@@ -632,6 +886,23 @@ static int init_vqs(struct virtio_balloon *vb)
 			return err;
 		}
 		virtqueue_kick(vb->stats_vq);
+	}
+
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_WS_REPORTING)) {
+		struct scatterlist sg;
+
+		vb->working_set_vq = vqs[VIRTIO_BALLOON_VQ_WORKING_SET];
+		vb->notification_vq = vqs[VIRTIO_BALLOON_VQ_NOTIFY];
+
+		/* Prime the notification virtqueue for the device to fill.*/
+		sg_init_one(&sg, vb->notification_buf, vb->notification_size);
+		err = virtqueue_add_inbuf(vb->notification_vq, &sg, 1, vb, GFP_KERNEL);
+		if (unlikely(err)) {
+			dev_err(&vb->vdev->dev,
+				"Failed to prepare notifications, err = %d\n", err);
+		} else {
+			virtqueue_kick(vb->notification_vq);
+		}
 	}
 
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
@@ -963,12 +1234,29 @@ static int virtballoon_probe(struct virtio_device *vdev)
 
 	INIT_WORK(&vb->update_balloon_stats_work, update_balloon_stats_func);
 	INIT_WORK(&vb->update_balloon_size_work, update_balloon_size_func);
+	INIT_WORK(&vb->update_balloon_working_set_work, update_balloon_ws_func);
+	INIT_WORK(&vb->update_balloon_notification_work, update_balloon_notification_func);
 	spin_lock_init(&vb->stop_update_lock);
 	mutex_init(&vb->balloon_lock);
 	init_waitqueue_head(&vb->acked);
 	vb->vdev = vdev;
 
 	balloon_devinfo_init(&vb->vb_dev_info);
+
+	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_WS_REPORTING)) {
+		virtio_cread_le(vdev, struct virtio_balloon_config, working_set_num_bins,
+				&vb->working_set_num_bins);
+		dev_err(&vb->vdev->dev, "in probe , num bins: %d ", vb->working_set_num_bins);
+		/* Allocate space for a Working Set report. */
+		vb->working_set = kcalloc(vb->working_set_num_bins,
+				 sizeof(struct virtio_balloon_working_set), GFP_KERNEL);
+		/* Allocate space for host notifications. */
+		vb->notification_size =
+			sizeof(uint16_t) +
+			sizeof(uint64_t) * (vb->working_set_num_bins + 1);
+		vb->notification_buf = kzalloc(vb->notification_size, GFP_KERNEL);
+		reset_working_set(vb);
+	}
 
 	err = init_vqs(vb);
 	if (err)
@@ -1130,11 +1418,15 @@ static void virtballoon_remove(struct virtio_device *vdev)
 		unregister_oom_notifier(&vb->oom_nb);
 	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT))
 		virtio_balloon_unregister_shrinker(vb);
+	if (virtio_has_feature(vb->vdev, VIRTIO_BALLOON_F_WS_REPORTING))
+		unregister_working_set_receiver(vb);
 	spin_lock_irq(&vb->stop_update_lock);
 	vb->stop_update = true;
 	spin_unlock_irq(&vb->stop_update_lock);
 	cancel_work_sync(&vb->update_balloon_size_work);
 	cancel_work_sync(&vb->update_balloon_stats_work);
+	cancel_work_sync(&vb->update_balloon_working_set_work);
+	cancel_work_sync(&vb->update_balloon_notification_work);
 
 	if (virtio_has_feature(vdev, VIRTIO_BALLOON_F_FREE_PAGE_HINT)) {
 		cancel_work_sync(&vb->report_free_page_work);
@@ -1200,6 +1492,7 @@ static unsigned int features[] = {
 	VIRTIO_BALLOON_F_FREE_PAGE_HINT,
 	VIRTIO_BALLOON_F_PAGE_POISON,
 	VIRTIO_BALLOON_F_REPORTING,
+	VIRTIO_BALLOON_F_WS_REPORTING,
 };
 
 static struct virtio_driver virtio_balloon_driver = {
