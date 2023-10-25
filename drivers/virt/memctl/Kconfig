@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
+config MEMCTL
+	tristate "memctl Guest Service Module"
+	depends on KVM_GUEST
+	help
+	  memctl is a guest kernel module that allows to communicate
+	  with hypervisor / VMM and control the guest memory backing.
+
+	  To compile as a module, choose M, the module will be called
+	  memctl. If unsure, say N.
